@@ -7,7 +7,7 @@ function newChat(){const chat={id:crypto.randomUUID(),title:'New conversation',m
 function getChat(){return chats.find(c=>c.id===current)}
 function selectChat(id){current=id;pending=[];render();$('sidebar').classList.remove('open')}
 function renderList(){$('conversations').replaceChildren();for(const c of chats){const b=document.createElement('button');b.className='conversation'+(c.id===current?' active':'');b.textContent=c.title;b.onclick=()=>selectChat(c.id);$('conversations').append(b)}}
-function addBubble(role,text,files=[]){const div=document.createElement('div');div.className='bubble '+role;const label=document.createElement('div');label.className='role';label.textContent=role==='assistant'?'✦ KAD Local AI':'You';const body=document.createElement('div');body.textContent=text;div.append(label,body);if(files.length){const info=document.createElement('span');info.className='attached-label';info.textContent='📎 '+files.join(', ');div.append(info)}$('messages').append(div);$('messages').scrollTop=$('messages').scrollHeight;return body}
+function addBubble(role,text,files=[]){const div=document.createElement('div');div.className='bubble '+role;const label=document.createElement('div');label.className='role';label.textContent=role==='assistant'?'✦ KAD Local AI':'You';const body=document.createElement('div');body.textContent=text;div.append(label,body);if(files.length){const info=document.createElement('span');info.className='attached-label';info.textContent='📎 '+files.join(', ');div.append(info)}if(role==='assistant')addExcelButton(div,()=>body.textContent);$('messages').append(div);$('messages').scrollTop=$('messages').scrollHeight;return body}
 function render() {renderList();$('messages').replaceChildren();const c=getChat();if(!c||!c.messages.length){const w=document.createElement('div');w.className='welcome';w.innerHTML='<div class="sparkle">✦</div><h1>How can I help you?</h1><p>Chat, paste an image, or attach a document.</p>';$('messages').append(w)}else for(const m of c.messages)addBubble(m.role,m.content,m.files||[]);renderAttachments()}
 function renderAttachments(){$('attachments').replaceChildren();pending.forEach((item,i)=>{const d=document.createElement('div');d.className='chip';d.textContent='📎 '+item.name+' ('+item.status+')';const b=document.createElement('button');b.textContent='×';b.onclick=()=>{pending.splice(i,1);renderAttachments()};d.append(b);$('attachments').append(d)})}
 async function addFiles(files){
@@ -28,6 +28,22 @@ async function addFiles(files){
 async function waitUploads(){await Promise.all(pending.map(item=>item.promise).filter(Boolean));const failed=pending.find(x=>!x.id);if(failed)throw Error('Upload failed: '+failed.name+' — '+failed.status)}
 function conversationFileIds(){return [...new Set([...(getChat()?.fileIds||[]),...pending.map(f=>f.id).filter(Boolean)])].slice(-5)}
 function busy(v){$('send').classList.toggle('hidden',v);$('stop').classList.toggle('hidden',!v);$('prompt').disabled=v;$('attach').disabled=v}
+function hasTable(t){return t.split('\n').filter(l=>(l.match(/\|/g)||[]).length>=2).length>=2}
+function addExcelButton(div,getText){
+  const btn=document.createElement('button');btn.className='excel-dl hidden';btn.textContent='⬇ Download Excel';
+  btn.onclick=async()=>{
+    btn.disabled=true;btn.textContent='Preparing…';
+    try{
+      const r=await fetch('/api/export-excel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:getText()})});
+      if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{}throw Error(d)}
+      const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download='kad-ai-draft.xlsx';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);
+    }catch(e){alert('Excel export failed: '+e.message)}
+    finally{btn.disabled=false;btn.textContent='⬇ Download Excel'}
+  };
+  div.append(btn);
+  const check=()=>btn.classList.toggle('hidden',!hasTable(getText()));
+  new MutationObserver(check).observe(div,{childList:true,subtree:true,characterData:true});check();
+}
 async function send(){
  if(controller)return;
  const text=$('prompt').value.trim();if(!text&&!pending.length)return;

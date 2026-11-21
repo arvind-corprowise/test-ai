@@ -101,10 +101,18 @@ function tableFromText(text){
       return [headers,...items.map(x=>headers.map(h=>x[h]??''))];
     }
   }catch{}
-  const lines=raw.split(/\r?\n/).filter(x=>x.trim().startsWith('|'));
+  // Accept Markdown tables with or without leading/trailing pipes.
+  const lines=raw.split(/\r?\n/).filter(x=>(x.match(/\|/g)||[]).length>=2);
   if(lines.length>=2){
-    const rows=lines.map(x=>x.trim().replace(/^\||\|$/g,'').split('|').map(y=>y.trim()))
-      .filter(x=>!x.every(y=>/^:?-{3,}:?$/.test(y)));
+    const clean=y=>y.trim().replace(/\*\*|__/g,'').replace(/^Column [A-Z]+:\s*/i,'');
+    // Only strip an outer leading pipe if the header uses one; otherwise " | Transfer" means an empty first cell.
+    const outer=lines[0].trim().startsWith('|');
+    let rows=lines.map(x=>{let l=x.replace(/\s+$/,'');if(outer)l=l.trim().replace(/^\|/,'');return l.replace(/\|$/,'').split('|').map(clean)})
+      .filter(x=>!x.every(y=>y===''||/^:?-{2,}:?$/.test(y)));
+    const width=rows[0].length;
+    rows=rows.map(r=>{r=r.slice(0,width);while(r.length<width)r.push('');return r});
+    // Convert numeric-looking cells (e.g. "4,247.14", "$85.00") to numbers.
+    rows=rows.map((r,i)=>i===0?r:r.map(c=>/^-?\$?[\d,]+(\.\d+)?$/.test(c)?Number(c.replace(/[$,]/g,'')):c));
     if(rows.length>=2)return rows;
   }
   return null;
