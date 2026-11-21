@@ -91,10 +91,20 @@ $('generateWorkbook').onclick=async()=>{
  try{
   await waitUploads();const fileIds=conversationFileIds();
   if(!revise&&!fileIds.length)throw Error('Attach source files first. They upload automatically.');
-  const response=await fetch('/api/workbook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instructions,model:$('modelSelect').value,previousId:revise?lastWorkbookId:'',fileIds})});
-  const result=await response.json();if(!response.ok)throw Error(result.detail||'Workbook generation failed');
+  const start=await fetch('/api/workbook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instructions,model:$('modelSelect').value,previousId:revise?lastWorkbookId:'',fileIds,async:true})});
+  const started=await start.json();if(!start.ok)throw Error(started.detail||'Workbook generation failed');
+  let result;
+  for(;;){
+    await new Promise(r=>setTimeout(r,1500));
+    let job;try{const jr=await fetch('/api/jobs/'+started.jobId);job=await jr.json();if(!jr.ok)throw Error(job.detail||'Job lookup failed')}catch(e){if(/not found/i.test(e.message))throw e;continue}
+    const recent=(job.progress||[]).slice(-4).map(p=>`[${p.at}s] ${p.msg}`).join('\n');
+    $('workbookStatus').textContent=`Working… ${job.elapsedSec||0}s elapsed (CPU inference can take several minutes)\n${recent}`;
+    if(job.status==='error')throw Error(job.error);
+    if(job.status==='done'){result=job.result;break}
+  }
   lastWorkbookId=result.id;
-  $('workbookStatus').textContent=`Created ${result.sheets.length} sheet(s), ${result.sourceCount} extracted records. Model: ${result.model}. `+result.sheets.map(s=>`${s.name} (${s.rows} rows)`).join('; ')+(result.warnings?.length?'\nWarnings: '+result.warnings.join('; '):'');
+  const v=(result.validation||[]).map(x=>`${x.source}: ${x.status.toUpperCase()} — ${x.totals?.transactions??0} transactions, ${x.errors} error(s), ${x.warnings} warning(s)`+(x.topIssues?.length?'\n  • '+x.topIssues.join('\n  • '):'')).join('\n');
+  $('workbookStatus').textContent=(result.kind==='bank'?(result.verified?'✔ VERIFIED. ':'⚠ NOT VERIFIED. '):'')+`Created ${result.sheets.length} sheet(s), ${result.sourceCount} extracted records. Model: ${result.model||'none'}. `+result.sheets.map(s=>`${s.name} (${s.rows} rows)`).join('; ')+(v?'\n\n'+v:'')+(result.warnings?.length?'\n\nNotes:\n• '+result.warnings.join('\n• '):'');
   const link=$('downloadWorkbook');link.href='/api/workbook/'+encodeURIComponent(result.id)+'/download';link.setAttribute('download',result.filename);link.classList.remove('hidden');
  }catch(e){$('workbookStatus').textContent='Error: '+e.message}
  finally{$('generateWorkbook').disabled=false}

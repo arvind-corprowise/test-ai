@@ -24,4 +24,17 @@ Open http://127.0.0.1:3000. Ollama must be running; the app auto-detects install
 
 **Security:** Intended for local/trusted network use only. Add authentication and per-user file ownership before internet exposure. Uploads accumulate indefinitely; monitor disk space. No automatic deletion is implemented.
 
-**Limits:** 5 MB per file, 5 files per operation; PDFs are rendered as images and processed by Ollama. Existing generator has 12-page per-PDF and 450-record safeguards. AI outputs require review.
+## Extraction & Excel pipeline
+
+Uploaded files → document type detection → text extraction / OCR → deterministic transaction parsing → deterministic validation → AI categorization → Excel.
+
+- **PDFs:** digital text is read with `pdftotext -layout` (Poppler). Only pages with no usable text (scanned) or mostly-image pages are rendered and OCR'd with an installed Ollama vision model. Mixed PDFs are handled page by page. No page is skipped.
+- **Models:** detected from Ollama `/api/tags` + `/api/show` capabilities; no model names in code. An already-loaded model is preferred so a second model is not loaded. Pick a model manually in the header dropdown if needed.
+- **Bank statements:** rows are parsed without AI (dates, descriptions, withdrawals, deposits, balances, page and line numbers). Node validates with integer-cent arithmetic: running balances, debit/credit placement, duplicates, summary totals, opening/closing balances, and "Page X of Y" completeness. The workbook contains Summary, Transactions, Validation, Discrepancies, Category Summary and Source Text sheets. A workbook is marked verified only when every check passes. The AI only assigns categories.
+- **Other documents:** AI designs the workbook from extracted text; numbers not found in the source are highlighted.
+- **Persistence:** extractions are cached by SHA-256 in `~/.kad-local-ai-workbooks/extractions/` (override with `KAD_DATA_DIR`). Revisions reuse the cache. Workbook records store model, timestamps, sources and validation results.
+- **Progress:** the Create Excel dialog polls `/api/jobs/:id`; there are no server-side response timeouts.
+
+Run tests: `npm test` (parser/validator/extraction/model/regeneration; Poppler and Ollama are mocked).
+
+**Limits:** 5 MB per file, 5 files per operation. AI categorization and OCR'd values still require review.

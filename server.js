@@ -1,8 +1,8 @@
 import express from 'express';
-import {generate,download} from './generator.js';
+import {generate,download,DATA} from './generator.js';
+import {extractDocument} from './extract.js';
 import fileUpload from 'express-fileupload';
 import crypto from 'node:crypto';
-import {pdfPageImages, visionExtract} from './pdf-vision.js';
 import {listModels, pickModel} from './models.js';
 import XLSX from 'xlsx';
 import path from 'node:path';
@@ -140,15 +140,17 @@ async function extract(file,ext){
   if(ext==='.xlsx'){
     const wb=XLSX.readFile(file.path);
     return wb.SheetNames.slice(0,5).map(name=>{
-      const rows=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:''}).slice(0,150);
-      return `Sheet: ${name}\n`+rows.map(row=>row.join(' | ')).join('\n');
-    }).join('\n').slice(0,12000);
+      const all=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:''});const rows=all.slice(0,150);
+      return `Sheet: ${name}\n`+rows.map(row=>row.join(' | ')).join('\n')+(all.length>150?`\n[NOTE: only the first 150 of ${all.length} rows are shown in chat; use Create Excel for the full sheet]`:'');
+    }).join('\n')+(wb.SheetNames.length>5?`\n[NOTE: only 5 of ${wb.SheetNames.length} sheets shown]`:'');
   }
   if(ext==='.csv'){
     // Preserve CSV quoting; model can interpret original CSV rows.
-    return (await fs.readFile(file.path)).toString('utf8').replace(/^\uFEFF/,'').split(/\r?\n/).slice(0,150).join('\n').slice(0,12000);
+    const all=(await fs.readFile(file.path)).toString('utf8').replace(/^\uFEFF/,'').split(/\r?\n/);
+    return all.slice(0,150).join('\n')+(all.length>150?`\n[NOTE: only the first 150 of ${all.length} lines are shown in chat; use Create Excel for the full file]`:'');
   }
-  return (await fs.readFile(file.path)).toString('utf8').slice(0,12000);
+  const text=(await fs.readFile(file.path)).toString('utf8');
+  return text.length>12000?text.slice(0,12000)+`\n[NOTE: truncated to 12000 of ${text.length} characters for chat]`:text;
 }
 
 app.post('/api/chat',async(req,res)=>{
@@ -172,12 +174,9 @@ app.post('/api/chat',async(req,res)=>{
       if(!IMAGE.has(ext)&&!DOC.has(ext))return res.status(400).json({detail:`Unsupported file: ${name}`});
       if(IMAGE.has(ext))images.push((await fs.readFile(file.path)).toString('base64'));
       else if(ext==='.pdf'){
-        const pages=await pdfPageImages(file.path,4);
-        const selectedVision=await pickModel(requestedModel,{needVision:true}).catch(()=>pickModel('auto',{needVision:true}));
-        for(let i=0;i<pages.length;i++){
-          const content=await visionExtract(selectedVision,pages[i],`Read PDF page ${i+1}/${pages.length} visually. Transcribe its content and tables accurately. Preserve dates, numbers and original row order. Do not guess.`,{tokens:1800});
-          docs.push(`--- ${name}, page ${i+1} of ${pages.length} ---\n${content}`);
-        }
+        // Digital text first (pdftotext -layout); OCR only for scanned pages. Cached by file hash.
+        const ex=await extractDocument({path:file.path,originalname:name},{dataDir:DATA,model:requestedModel});
+        for(const p of ex.pages)docs.push(`--- ${name}, page ${p.page} of ${ex.pageCount} (${p.method==='text'?'digital text':'OCR'}) ---\n${p.text}`);
       } else docs.push(`--- ${name} ---\n${await extract(file,ext)}`);
     }
     let prompt=message.trim()||'Analyze the attached files.';
@@ -206,13 +205,38 @@ app.post('/api/chat',async(req,res)=>{
   }
 });
 app.use((err,_req,res,_next)=>res.status(400).json({detail:err.message}));
+// Long-running workbook jobs: POST with {async:true} returns {jobId}; poll GET /api/jobs/:id for progress.
+const jobs=new Map();
+const JOB_DIR=path.join(DATA,'jobs');
+await fs.mkdir(JOB_DIR,{recursive:true,mode:0o700});
+async function runWorkbook(body,onProgress){
+  const staged=await storedFiles(body.fileIds || []);
+  const result=await generate({instructions:String(body?.instructions||''),files:staged,model:String(body?.model||'auto'),previousId:String(body?.previousId||''),force:body?.reextract===true,onProgress});
+  const saved=await download(result.id);
+  await fs.writeFile(path.join(GENERATED_DIR,`${result.id}.xlsx`),saved.buffer,{mode:0o600});
+  return result;
+}
+app.get('/api/jobs/:id',async(req,res)=>{
+  if(!UUID.test(req.params.id))return res.status(400).json({detail:'Invalid job ID'});
+  const job=jobs.get(req.params.id);
+  if(job)return res.json(job);
+  try{res.json(JSON.parse(await fs.readFile(path.join(JOB_DIR,req.params.id+'.json'),'utf8')))}
+  catch{res.status(404).json({detail:'Job not found (it may have been interrupted by a server restart; please run it again)'})}
+});
 app.post('/api/workbook',async(req,res)=>{
+  if(req.body?.async===true){
+    const id=crypto.randomUUID();const started=Date.now();
+    const job={id,status:'running',progress:[],stage:'Starting',startedAt:new Date(started).toISOString(),elapsedSec:0};
+    jobs.set(id,job);
+    res.json({jobId:id});
+    const onProgress=msg=>{job.stage=msg;job.elapsedSec=Math.round((Date.now()-started)/1000);job.progress.push({at:job.elapsedSec,msg});if(job.progress.length>200)job.progress.shift();console.log(`[job ${id.slice(0,8)}] ${msg}`)};
+    runWorkbook(req.body,onProgress).then(result=>{job.status='done';job.result=result;job.stage='Done'})
+      .catch(e=>{job.status='error';job.error=String(e.message||e);job.stage='Failed'})
+      .finally(async()=>{job.elapsedSec=Math.round((Date.now()-started)/1000);await fs.writeFile(path.join(JOB_DIR,id+'.json'),JSON.stringify(job),{mode:0o600}).catch(()=>{});setTimeout(()=>jobs.delete(id),3600000)});
+    return;
+  }
   try{
-    const staged=await storedFiles(req.body.fileIds || []);
-    const result=await generate({instructions:String(req.body?.instructions||''),files:staged,model:String(req.body?.model||'auto'),previousId:String(req.body?.previousId||'')});
-    // Retain generated Excel under project/generated as requested, as well as existing revision storage.
-    const saved=await download(result.id);
-    await fs.writeFile(path.join(GENERATED_DIR,`${result.id}.xlsx`),saved.buffer,{mode:0o600});
+    const result=await runWorkbook(req.body,()=>{});
     res.json(result);
   }catch(e){res.status(400).json({detail:String(e.message||e)})}
 });
@@ -220,5 +244,7 @@ app.get('/api/workbook/:id/download',async(req,res)=>{
   try{const {buffer,filename}=await download(req.params.id);res.set('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');res.set('Content-Disposition',`attachment; filename="${filename.replace(/["\r\n]/g,'')}"`);res.send(buffer)}
   catch(e){res.status(404).json({detail:'Workbook not found'})}
 });
-app.listen(PORT,'127.0.0.1' ,()=>console.log(`KAD Local AI at http://127.0.0.1:${PORT}`));
+const server=app.listen(PORT,'127.0.0.1' ,()=>console.log(`KAD Local AI at http://127.0.0.1:${PORT}`));
+// CPU inference can take a long time: no arbitrary response timeouts.
+server.requestTimeout=0;server.timeout=0;server.keepAliveTimeout=65000;
 
