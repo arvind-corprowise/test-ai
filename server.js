@@ -40,10 +40,13 @@ function validIds(value) {
 async function storedFiles(ids) {
   const result=[];
   for(const id of validIds(ids)) {
-    const meta=JSON.parse(await fs.readFile(path.join(UPLOAD_DIR,id+'.json'),'utf8'));
-    const filepath=path.join(UPLOAD_DIR,id+meta.ext);
-    const stat=await fs.stat(filepath);
-    if(!stat.isFile() || stat.size===0) throw Error(`Saved file unavailable: ${meta.originalname}`);
+    let meta,stat,filepath;
+    try{
+      meta=JSON.parse(await fs.readFile(path.join(UPLOAD_DIR,id+'.json'),'utf8'));
+      filepath=path.join(UPLOAD_DIR,id+meta.ext);
+      stat=await fs.stat(filepath);
+    }catch(e){if(e.code==='ENOENT'){console.warn('Skipping missing upload',id);continue}throw e}
+    if(!stat.isFile() || stat.size===0){console.warn('Skipping empty upload',id);continue}
     result.push({id,originalname:meta.originalname,path:filepath,size:stat.size});
   }
   return result;
@@ -74,7 +77,7 @@ app.post('/api/files/upload',async(req,res)=>{
   }catch(e){if(dest)await fs.rm(dest,{force:true}).catch(()=>{});res.status(400).json({detail:e.message})}
 });
 app.get('/api/files/:id',async(req,res)=>{
-  try {const [file]=await storedFiles([req.params.id]);res.json({fileId:file.id,filename:file.originalname,size:file.size})}
+  try {const [file]=await storedFiles([req.params.id]);if(!file)throw Error();res.json({fileId:file.id,filename:file.originalname,size:file.size})}
   catch{res.status(404).json({detail:'File not found'})}
 });
 app.disable('x-powered-by');

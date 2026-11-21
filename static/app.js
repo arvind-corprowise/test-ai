@@ -83,4 +83,13 @@ $('generateWorkbook').onclick=async()=>{
  }catch(e){$('workbookStatus').textContent='Error: '+e.message}
  finally{$('generateWorkbook').disabled=false}
 };
-loadModels();
+async function pruneMissingFiles(){
+  let changed=false;
+  for(const chat of chats){
+    const ids=chat.fileIds||[];const keep=[];
+    for(const id of ids){try{const r=await fetch('/api/files/'+id);if(r.ok)keep.push(id);else changed=true}catch{keep.push(id)}}
+    chat.fileIds=keep;
+  }
+  if(changed)save();
+}
+loadModels();pruneMissingFiles();
