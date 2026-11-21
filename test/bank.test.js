@@ -116,3 +116,14 @@ test('OCR pipe-table output (scanned page) is parsed deterministically', () => {
 test('non-statement text is not detected as a bank statement', () => {
   assert.equal(detectBankStatement(pages('Meeting notes\nAttendees: A, B\nBudget 1,200.00 approved')), false);
 });
+
+test('strict schema: text in amount fields or numeric descriptions are errors', () => {
+  const parsed = {transactions: [
+    {date: '15 Mar', description: '85.00', withdrawal: null, deposit: 8500, balance: null, sourceLines: [1], flags: []},
+    {date: 'Transfer', description: 'x', withdrawal: 'abc', deposit: null, balance: null, sourceLines: [2], flags: []}],
+    anomalies: [], summary: {}, pageMarkers: []};
+  const v = validateStatement(parsed, {pageCount: 1});
+  const c = v.issues.map(i => i.code);
+  assert.ok(c.includes('SCHEMA_DESCRIPTION') && c.includes('SCHEMA_AMOUNT') && c.includes('SCHEMA_DATE'));
+  assert.equal(v.status, 'failed');
+});

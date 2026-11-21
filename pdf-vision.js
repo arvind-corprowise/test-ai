@@ -50,6 +50,27 @@ export async function pdfPageTexts(pdfPath, pages) {
   return out;
 }
 
+const decodeXml = t => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&amp;/g, '&');
+/** Parse `pdftotext -bbox` XHTML into per-page word lists [{x0,x1,y0,y1,t}] (PDF points, y grows downward). */
+export function parseBboxXml(xml) {
+  const pages = [];
+  for (const pm of String(xml).matchAll(/<page\b[^>]*>([\s\S]*?)<\/page>/g)) {
+    const words = [];
+    for (const wm of pm[1].matchAll(/<word\s+xMin="([\d.]+)"\s+yMin="([\d.]+)"\s+xMax="([\d.]+)"\s+yMax="([\d.]+)"\s*>([\s\S]*?)<\/word>/g))
+      words.push({x0: +wm[1], y0: +wm[2], x1: +wm[3], y1: +wm[4], t: decodeXml(wm[5])});
+    pages.push(words);
+  }
+  return pages;
+}
+/** Word coordinates for every page (used to map table columns from the real header positions). */
+export async function pdfPageWords(pdfPath, pages) {
+  try {
+    const {stdout} = await run('pdftotext', ['-bbox', '-enc', 'UTF-8', pdfPath, '-'], {timeout: 300000, maxBuffer: 128 * 1024 * 1024});
+    const out = parseBboxXml(stdout);
+    return out.length === pages ? out : null;
+  } catch { return null; } // positions are an accuracy aid; layout text remains available
+}
+
 /** Map of page -> largest image area fraction hint (pixels). Empty map if pdfimages is unavailable. */
 export async function pdfImagePages(pdfPath) {
   const pages = new Map();

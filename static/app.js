@@ -7,8 +7,8 @@ function newChat(){const chat={id:crypto.randomUUID(),title:'New conversation',m
 function getChat(){return chats.find(c=>c.id===current)}
 function selectChat(id){current=id;pending=[];render();$('sidebar').classList.remove('open')}
 function renderList(){$('conversations').replaceChildren();for(const c of chats){const b=document.createElement('button');b.className='conversation'+(c.id===current?' active':'');b.textContent=c.title;b.onclick=()=>selectChat(c.id);$('conversations').append(b)}}
-function addBubble(role,text,files=[]){const div=document.createElement('div');div.className='bubble '+role;const label=document.createElement('div');label.className='role';label.textContent=role==='assistant'?'✦ KAD Local AI':'You';const body=document.createElement('div');body.textContent=text;div.append(label,body);if(files.length){const info=document.createElement('span');info.className='attached-label';info.textContent='📎 '+files.join(', ');div.append(info)}if(role==='assistant')addExcelButton(div,()=>body.textContent);$('messages').append(div);$('messages').scrollTop=$('messages').scrollHeight;return body}
-function render() {renderList();$('messages').replaceChildren();const c=getChat();if(!c||!c.messages.length){const w=document.createElement('div');w.className='welcome';w.innerHTML='<div class="sparkle">✦</div><h1>How can I help you?</h1><p>Chat, paste an image, or attach a document.</p>';$('messages').append(w)}else for(const m of c.messages)addBubble(m.role,m.content,m.files||[]);renderAttachments()}
+function addBubble(role,text,files=[],meta=null){const div=document.createElement('div');div.className='bubble '+role;const label=document.createElement('div');label.className='role';label.textContent=role==='assistant'?'✦ KAD Local AI':'You';const body=document.createElement('div');body.textContent=text;div.append(label,body);if(files.length){const info=document.createElement('span');info.className='attached-label';info.textContent='📎 '+files.join(', ');div.append(info)}if(role==='assistant')addExcelButton(div,()=>body.textContent,()=>meta?.statement);$('messages').append(div);$('messages').scrollTop=$('messages').scrollHeight;return body}
+function render() {renderList();$('messages').replaceChildren();const c=getChat();if(!c||!c.messages.length){const w=document.createElement('div');w.className='welcome';w.innerHTML='<div class="sparkle">✦</div><h1>How can I help you?</h1><p>Chat, paste an image, or attach a document.</p>';$('messages').append(w)}else for(const m of c.messages)addBubble(m.role,m.content,m.files||[],m);renderAttachments()}
 function renderAttachments(){$('attachments').replaceChildren();pending.forEach((item,i)=>{const d=document.createElement('div');d.className='chip';d.textContent='📎 '+item.name+' ('+item.status+')';const b=document.createElement('button');b.textContent='×';b.onclick=()=>{pending.splice(i,1);renderAttachments()};d.append(b);$('attachments').append(d)})}
 async function addFiles(files){
  for(const f of files){
@@ -29,20 +29,43 @@ async function waitUploads(){await Promise.all(pending.map(item=>item.promise).f
 function conversationFileIds(){return [...new Set([...(getChat()?.fileIds||[]),...pending.map(f=>f.id).filter(Boolean)])].slice(-5)}
 function busy(v){$('send').classList.toggle('hidden',v);$('stop').classList.toggle('hidden',!v);$('prompt').disabled=v;$('attach').disabled=v}
 function hasTable(t){return t.split('\n').filter(l=>(l.match(/\|/g)||[]).length>=2).length>=2}
-function addExcelButton(div,getText){
+// Runs the deterministic, validated workbook pipeline for the given uploaded files and downloads the result.
+async function validatedWorkbook(fileIds,onStatus){
+  const start=await fetch('/api/workbook',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instructions:'Validated transaction workbook from chat. Categorize transactions.',model:$('modelSelect').value,fileIds,async:true})});
+  const started=await start.json();if(!start.ok)throw Error(started.detail||'Workbook generation failed');
+  for(;;){
+    await new Promise(r=>setTimeout(r,1500));
+    const jr=await fetch('/api/jobs/'+started.jobId);const job=await jr.json();if(!jr.ok)throw Error(job.detail||'Job lookup failed');
+    onStatus?.(job.stage||'Working…');
+    if(job.status==='error')throw Error(job.error);
+    if(job.status==='done')return job.result;
+  }
+}
+function triggerDownload(href,name){const a=document.createElement('a');a.href=href;a.download=name;document.body.append(a);a.click();a.remove()}
+function addExcelButton(div,getText,getStatement=()=>null){
   const btn=document.createElement('button');btn.className='excel-dl hidden';btn.textContent='⬇ Download Excel';
+  const label=()=>getStatement()?'⬇ Download validated Excel':'⬇ Download Excel';
   btn.onclick=async()=>{
     btn.disabled=true;btn.textContent='Preparing…';
     try{
+      const st=getStatement();
+      if(st?.fileIds?.length){
+        // Bank statements: values come from the deterministic parser + validation, never from the chat text.
+        const result=await validatedWorkbook(st.fileIds,s=>{btn.textContent=s.slice(0,60)});
+        triggerDownload('/api/workbook/'+encodeURIComponent(result.id)+'/download',result.filename);
+        const v=(result.validation||[]).map(x=>`${x.source}: ${x.status.toUpperCase()} (${x.errors} error(s), ${x.warnings} warning(s))`).join('\n');
+        if(!result.verified)alert('Workbook downloaded but NOT verified:\n'+v+'\n\nSee the Validation and Discrepancies sheets.');
+        return;
+      }
       const r=await fetch('/api/export-excel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:getText()})});
       if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{}throw Error(d)}
-      const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download='kad-ai-draft.xlsx';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);
+      const url=URL.createObjectURL(await r.blob());triggerDownload(url,'kad-ai-draft.xlsx');setTimeout(()=>URL.revokeObjectURL(url),5000);
     }catch(e){alert('Excel export failed: '+e.message)}
-    finally{btn.disabled=false;btn.textContent='⬇ Download Excel'}
+    finally{btn.disabled=false;btn.textContent=label()}
   };
   div.append(btn);
-  const check=()=>btn.classList.toggle('hidden',!hasTable(getText()));
-  new MutationObserver(check).observe(div,{childList:true,subtree:true,characterData:true});check();
+  const check=()=>{btn.classList.toggle('hidden',!getStatement()&&!hasTable(getText()));if(!btn.disabled)btn.textContent=label()};
+  new MutationObserver(check).observe(div,{childList:true,subtree:true,characterData:true});div.addEventListener('statement',check,true);check();
 }
 async function send(){
  if(controller)return;
@@ -54,12 +77,12 @@ async function send(){
   c.messages.push({role:'user',content:text||'Analyze the attached files.',files:files.map(f=>f.name)});
   if(c.title==='New conversation')c.title=(text||files[0]?.name||'New conversation').slice(0,40);
   save();$('prompt').value='';pending=[];render();
-  const reply={role:'assistant',content:''};c.messages.push(reply);const body=addBubble('assistant','Thinking…');
+  const reply={role:'assistant',content:''};c.messages.push(reply);const body=addBubble('assistant','Thinking…',[],reply);
   try{
    const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,model:$('modelSelect').value,history:previous,fileIds:ids}),signal:controller.signal});
    if(!response.ok){let detail=await response.text();try{detail=JSON.parse(detail).detail||detail}catch{}throw Error(detail)}
    const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';
-   while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const lines=buffer.split('\n');buffer=lines.pop();for(const line of lines){if(!line.trim())continue;const part=JSON.parse(line);if(part.error)throw Error(part.error);if(part.text){reply.content+=part.text;body.textContent=reply.content;$('messages').scrollTop=$('messages').scrollHeight}}}
+   while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const lines=buffer.split('\n');buffer=lines.pop();for(const line of lines){if(!line.trim())continue;const part=JSON.parse(line);if(part.error)throw Error(part.error);if(part.statement){reply.statement=part.statement;save();body.dispatchEvent(new Event('statement'))}if(part.text){reply.content+=part.text;body.textContent=reply.content;$('messages').scrollTop=$('messages').scrollHeight}}}
    if(!reply.content)reply.content='No response generated.';
   }catch(e){reply.content+=(reply.content?'\n\n':'')+(e.name==='AbortError'?'[Stopped]':'Error: '+e.message)}
   finally{body.textContent=reply.content;save()}

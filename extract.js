@@ -4,18 +4,18 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {pdfPageCount, pdfPageTexts, pdfImagePages, renderPage, visionExtract, OCR_PROMPT} from './pdf-vision.js';
+import {pdfPageCount, pdfPageTexts, pdfPageWords, pdfImagePages, renderPage, visionExtract, OCR_PROMPT} from './pdf-vision.js';
 import {pickModel} from './models.js';
 
-export const EXTRACTOR_VERSION = 2;
+export const EXTRACTOR_VERSION = 3; // v3: word coordinates for column mapping
 const IMAGE = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const MIN_TEXT_CHARS = 30;      // fewer alphanumerics than this → page is treated as scanned
 const MIXED_TEXT_CHARS = 200;   // a page with a large image and little text gets OCR in addition to its text
 const LARGE_IMAGE_PX = 600 * 600;
 
-let deps = {pdfPageCount, pdfPageTexts, pdfImagePages, renderPage, visionExtract, pickModel};
+let deps = {pdfPageCount, pdfPageTexts, pdfPageWords, pdfImagePages, renderPage, visionExtract, pickModel};
 /** Test hook. */
-export function _setDeps(d) { deps = d ? {...deps, ...d} : {pdfPageCount, pdfPageTexts, pdfImagePages, renderPage, visionExtract, pickModel}; }
+export function _setDeps(d) { deps = d ? {...deps, ...d} : {pdfPageCount, pdfPageTexts, pdfPageWords, pdfImagePages, renderPage, visionExtract, pickModel}; }
 
 export async function hashFile(p) {
   const h = crypto.createHash('sha256');
@@ -80,12 +80,13 @@ export async function extractDocument(file, {dataDir, model = 'auto', onProgress
     onProgress(`${name}: ${count} page(s); reading digital text`);
     const texts = await deps.pdfPageTexts(file.path, count);
     if (texts.length !== count) throw Error(`${name}: text extraction returned ${texts.length} of ${count} pages; refusing to continue with missing pages`);
+    const words = await deps.pdfPageWords(file.path, count);
     const images = await deps.pdfImagePages(file.path);
     for (let p = 1; p <= count; p++) {
       const text = texts[p - 1] || ''; const chars = alnum(text);
       const scanned = chars < MIN_TEXT_CHARS;
       const mixed = !scanned && chars < MIXED_TEXT_CHARS && (images.get(p) || 0) >= LARGE_IMAGE_PX;
-      if (!scanned && !mixed) { pages.push({page: p, method: 'text', text}); continue; }
+      if (!scanned && !mixed) { pages.push({page: p, method: 'text', text, ...(words?.[p - 1]?.length ? {words: words[p - 1]} : {})}); continue; }
       const vm = await getVision();
       onProgress(`${name}: page ${p}/${count} is ${scanned ? 'scanned' : 'partly scanned'}; running OCR with ${vm}`);
       const img = await deps.renderPage(file.path, p, 150);

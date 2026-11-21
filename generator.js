@@ -96,6 +96,8 @@ function buildBankSpec(results, categories, {model, instructions}) {
   for (const r of results) for (const t of r.parsed.transactions) { const c = categories[j++] ?? 'Uncategorized'; const e = cats.get(c) || {w: 0, d: 0, n: 0}; e.w += t.withdrawal ?? 0; e.d += t.deposit ?? 0; e.n++; cats.set(c, e); }
   const catRows = [...cats].sort((a, b) => a[0].localeCompare(b[0])).map(([c, e]) => [c, e.n, n(e.w), n(e.d)]);
   const overall = results.every(r => r.validation.verified) ? 'verified' : results.some(r => r.validation.status === 'failed') ? 'FAILED' : 'UNVERIFIED';
+  // Final guard: amount columns (Withdrawals, Deposits, Statement Balance, Calculated Balance) hold only numbers or blanks.
+  tx.forEach((row, i) => { for (const col of [5, 6, 7, 8]) if (row[col] !== null && typeof row[col] !== 'number') throw Error(`Internal error: non-numeric value in amount column on Transactions row ${i + 1}; workbook not written`); });
   const MAX = 15000; const srcRows = src.slice(0, MAX);
   return {
     filename: `statement-${overall}`,

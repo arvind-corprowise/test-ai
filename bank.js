@@ -10,6 +10,7 @@ const OPENING_RE = /\b(opening|previous|beginning|starting) balance\b|\bbalance 
 const CLOSING_RE = /\b(closing|ending|new) balance\b|\bbalance carried forward\b/i;
 const TOTAL_RE = /^\s*(sub)?totals?\b/i;
 const MONEY_TYPES = ['withdrawal', 'deposit', 'amount'];
+const PAGE_FOOTER = /^(?:page\s*)?\d+\s*(?:of|\/)\s*\d+$/i;
 const AMOUNT_TYPES = ['withdrawal', 'deposit', 'balance', 'amount'];
 
 export function headerType(t) {
@@ -81,7 +82,9 @@ function parseLayoutLine(line, layout) {
   const dateZone = descCol ? descCol.start + 2 : 14;
   let date = null, rest = left;
   if (lead < dateZone) { const d = takeDate(left); if (d.date) { date = d.date; rest = d.rest; } }
-  return {date, desc: rest.replace(/\s+/g, ' ').trim(), amounts, conflicts, indent: lead, amountStart: zoneStart, lineLength: line.trimEnd().length};
+  const lineLength = line.trimEnd().length;
+  return {date, desc: rest.replace(/\s+/g, ' ').trim(), amounts, conflicts,
+    prose: !tokens.length && lineLength > zoneStart + 18, contIndent: !date && descCol ? lead > descCol.start + 1 : false};
 }
 function parsePipeLine(line, hdr) {
   const cells = splitPipe(line, hdr.lead); const out = {date: null, desc: '', amounts: {}, conflicts: [], indent: 0};
@@ -97,6 +100,90 @@ function parsePipeLine(line, hdr) {
   return out;
 }
 
+// ---------- Word-coordinate mode (pdftotext -bbox): columns come from the PDF's real header positions ----------
+const AMOUNT_ONLY = /^(?:[+-]\s?)?\(?-?\$?(?:\d{1,3}(?:,\d{3})+|\d+)?\.\d{2}\)?(?:-|\s?CR|\s?DR)?$/i;
+/** Group words [{x0,x1,y0,y1,t}] into visual lines (top to bottom). */
+export function linesFromWords(words) {
+  const ws = [...words].sort((a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2 || a.x0 - b.x0);
+  const lines = [];
+  for (const w of ws) {
+    const mid = (w.y0 + w.y1) / 2; const h = Math.max(1, w.y1 - w.y0);
+    const line = lines.at(-1);
+    if (line && Math.abs(mid - line.mid) <= Math.max(2, h * 0.45)) { line.words.push(w); line.mid = (line.mid * (line.words.length - 1) + mid) / line.words.length; }
+    else lines.push({mid, words: [w]});
+  }
+  for (const l of lines) { l.words.sort((a, b) => a.x0 - b.x0); l.text = l.words.map(w => w.t).join(' '); }
+  return lines;
+}
+/** Merge words separated by a normal space into phrases; column gaps stay separate. */
+function phrases(words) {
+  const out = [];
+  for (const w of words) {
+    const cur = out.at(-1); const h = Math.max(1, w.y1 - w.y0);
+    if (cur && w.x0 - cur.x1 <= Math.max(2.5, h * 0.45)) { cur.t += ' ' + w.t; cur.x1 = w.x1; }
+    else out.push({t: w.t, x0: w.x0, x1: w.x1});
+  }
+  return out;
+}
+function wordHeader(lines, i) {
+  const build = ps => {
+    const cols = []; const types = new Set();
+    for (const p of ps) { const type = headerType(p.t); if (!type) continue; const ex = cols.find(c => c.type === type);
+      if (ex) { ex.x0 = Math.min(ex.x0, p.x0); ex.x1 = Math.max(ex.x1, p.x1); continue; }
+      cols.push({type, x0: p.x0, x1: p.x1, text: p.t}); types.add(type); }
+    return isHeaderSet(types) ? cols.sort((a, b) => a.x0 - b.x0) : null;
+  };
+  const ps = phrases(lines[i].words);
+  if (ps.some(p => AMOUNT_ONLY.test(p.t))) return null;
+  const one = build(ps); if (one) return {words: true, cols: one, used: 1};
+  if (i + 1 < lines.length) {
+    const ps2 = phrases(lines[i + 1].words);
+    if (ps2.some(p => AMOUNT_ONLY.test(p.t)) || build(ps2)) return null;
+    // Two-line headers: merge only when the lines are vertically close.
+    if (Math.abs(lines[i + 1].mid - lines[i].mid) < 14) { const two = build([...ps, ...ps2]); if (two) return {words: true, cols: two, used: 2}; }
+  }
+  return null;
+}
+/** Column boundaries derived from header positions: an amount belongs to the header it overlaps most, else the nearest. */
+function amountColumnFor(p, cols) {
+  let best = null, bestScore = Infinity;
+  for (const c of cols) {
+    const overlap = Math.min(p.x1, c.x1) - Math.max(p.x0, c.x0);
+    const score = overlap > 0 ? -overlap : Math.min(Math.abs(p.x1 - c.x1), Math.abs(p.x0 - c.x0), Math.abs((p.x0 + p.x1) / 2 - (c.x0 + c.x1) / 2));
+    if (score < bestScore) { bestScore = score; best = c; }
+  }
+  return best;
+}
+function parseWordLine(line, hdr) {
+  const amountCols = hdr.cols.filter(c => AMOUNT_TYPES.includes(c.type));
+  const descCol = hdr.cols.find(c => c.type === 'description');
+  const dateCol = hdr.cols.find(c => c.type === 'date');
+  // The amount area starts just left of the left-most amount header (right-aligned numbers may start a little before it).
+  const zone = Math.min(...amountCols.map(c => c.x0)) - 12;
+  const out = {date: null, desc: '', amounts: {}, conflicts: [], prose: false, contIndent: false};
+  const descParts = [];
+  for (const p of phrases(line.words)) {
+    if (p.x1 > zone + 12 && p.x0 >= zone) {
+      // Everything in the amount area must be a single amount. Text is never written into amount columns.
+      const toks = p.t.split(/\s+(?=[\d.$(+-])/);
+      for (const tk of toks.length > 1 && toks.every(x => AMOUNT_ONLY.test(x)) ? toks : [p.t]) {
+        if (!AMOUNT_ONLY.test(tk)) { out.conflicts.push(`text "${tk}" found in amount area`); continue; }
+        const col = amountColumnFor(p, amountCols);
+        if (out.amounts[col.type] !== undefined) out.conflicts.push(`two amounts in ${col.type} column`);
+        out.amounts[col.type] = tk;
+      }
+      continue;
+    }
+    if (p.x1 > zone + 12 && p.t.length > 25) { out.prose = true; descParts.push(p.t); continue; } // sentence running across columns
+    const inDateCol = dateCol && (descCol ? p.x1 <= descCol.x0 + 1 : p.x0 < dateCol.x1 + 4);
+    if (inDateCol && !out.date && DATE_RE.test(p.t)) { const m = p.t.match(DATE_RE); out.date = m[0].trim(); const rest = p.t.slice(m[0].length).trim(); if (rest) descParts.push(rest); continue; }
+    if (!descParts.length && descCol && p.x0 > descCol.x0 + 8) out.contIndent = true;
+    descParts.push(p.t);
+  }
+  out.desc = descParts.join(' ').replace(/\s+/g, ' ').trim();
+  return out;
+}
+
 function pageNumbers(text) {
   const m = String(text).match(/\bpage\s*(\d+)\s*(?:of|\/)\s*(\d+)\b/i) || String(text).match(/^\s*(\d+)\s+of\s+(\d+)\s*$/im);
   return m ? {page: Number(m[1]), of: Number(m[2])} : null;
@@ -104,7 +191,10 @@ function pageNumbers(text) {
 
 /** True when any page contains a recognizable transaction-table header. */
 export function detectBankStatement(pages) {
-  return pages.some(p => { const lines = String(p.text).split('\n'); return lines.some((l, i) => layoutHeader(lines, i) || pipeHeader(l)); });
+  return pages.some(p => {
+    if (Array.isArray(p.words) && p.words.length) { const wl = linesFromWords(p.words); if (wl.some((_, i) => wordHeader(wl, i))) return true; }
+    const lines = String(p.text).split('\n'); return lines.some((l, i) => layoutHeader(lines, i) || pipeHeader(l));
+  });
 }
 
 /**
@@ -123,7 +213,27 @@ export function parseBankStatement(pages) {
     const marker = pageNumbers(pg.text); if (marker) pageMarkers.push({sourcePage: pg.page, ...marker});
     let layout = null, inTable = false, pending = null, last = null, blankRun = 0;
     const parsed = [];
-    for (let i = 0; i < lines.length; i++) {
+    const wlines = Array.isArray(pg.words) && pg.words.length ? linesFromWords(pg.words) : null;
+    for (let i = 0; wlines && i < wlines.length; i++) {
+      const h = wordHeader(wlines, i);
+      if (h) { layout = h; inTable = true; tablePages.add(pg.page); i += h.used - 1; continue; }
+      if (!inTable) continue;
+      // Large vertical gap = end of the table block (blank line).
+      if (PAGE_FOOTER.test(wlines[i].text.trim())) continue;
+      const row = {i, raw: wlines[i].text, ...parseWordLine(wlines[i], layout)};
+      if (i > 0 && wlines[i].mid - wlines[i - 1].mid > 2.6 * Math.max(8, wlines[i].words[0].y1 - wlines[i].words[0].y0)) {
+        // A large gap ends the table unless the next line is clearly another dated transaction row.
+        if (!(row.date && MONEY_TYPES.some(t => row.amounts[t] !== undefined))) { parsed.push({end: true, i}); inTable = false; continue; }
+        parsed.push({blank: true, i});
+      }
+      parsed.push(row);
+    }
+    if (wlines) {
+      // Mark table rows in the layout text as consumed so the summary scan ignores them.
+      const rowTexts = new Set(parsed.filter(p => p.raw).map(p => p.raw.replace(/\s+/g, ' ').trim()));
+      lines.forEach((l, i) => { if (rowTexts.has(l.replace(/\s+/g, ' ').trim())) consumed.add(`${pg.page}:${i}`); });
+    }
+    for (let i = 0; !wlines && i < lines.length; i++) {
       const raw = lines[i];
       const h = layoutHeader(lines, i) || pipeHeader(raw);
       if (h) { layout = h; inTable = true; pending = null; last = null; tablePages.add(pg.page);
@@ -131,6 +241,7 @@ export function parseBankStatement(pages) {
       if (!inTable) continue;
       if (layout.pipe && /^[\s|:\-]+$/.test(raw) && raw.includes('-')) { consumed.add(`${pg.page}:${i}`); continue; } // markdown separator
       if (!raw.trim()) { parsed.push({blank: true, i}); continue; }
+      if (PAGE_FOOTER.test(raw.trim())) continue;
       if (layout.pipe && !isPipeLine(raw)) { parsed.push({end: true, i}); continue; }
       parsed.push({i, raw, ...(layout.pipe ? parsePipeLine(raw, layout) : parseLayoutLine(raw, layout))});
     }
@@ -142,7 +253,7 @@ export function parseBankStatement(pages) {
       const p = parsed[k];
       if (p.blank) { blankRun++; continue; }
       if (p.end) { if (last || pending) ended = true; continue; }
-      const key = `${pg.page}:${p.i}`; const ln = p.i + 1;
+      const key = wlines ? `w${pg.page}:${p.i}` : `${pg.page}:${p.i}`; const ln = p.i + 1;
       const desc = p.desc || '';
       const balanceVal = cents(p.amounts.balance);
       if (OPENING_RE.test(desc) && !hasMoney(p)) {
@@ -164,12 +275,11 @@ export function parseBankStatement(pages) {
       if (!hasMoney(p) && balanceVal === null) {
         // Text-only row: start of a multiline description, or continuation of the previous one.
         const nxt = nextNonBlank(k);
-        const prose = !layout.pipe && p.lineLength > p.amountStart + 10; // long text running into amount columns = not table content
-        if (prose) { if (last || pending) ended = true; continue; }
+        if (p.prose) { if (last || pending) ended = true; continue; } // long text running into amount columns = not table content
         consumed.add(key);
         if (p.date) pending = {date: p.date, desc, lines: [ln]};
         else if (pending) { pending.desc = (pending.desc + ' ' + desc).trim(); pending.lines.push(ln); }
-        else if (last && blankRun <= 1 && !layout.pipe && p.indent > (layout.cols.find(c => c.type === 'description')?.start ?? 0) + 1) { last.description = (last.description + ' ' + desc).trim(); last.sourceLines.push(ln); last.raw.push(p.raw.trim()); } // indented further → continuation of previous row
+        else if (last && blankRun <= 1 && p.contIndent) { last.description = (last.description + ' ' + desc).trim(); last.sourceLines.push(ln); last.raw.push(p.raw.trim()); } // indented further → continuation of previous row
         else if (nxt && !nxt.blank && !nxt.end && hasMoney(nxt) && !nxt.date) pending = {date: null, desc, lines: [ln]}; // amount printed on the last line of a multi-line entry
         else if (last && blankRun <= 1) { last.description = (last.description + ' ' + desc).trim(); last.sourceLines.push(ln); last.raw.push(p.raw.trim()); }
         else if (desc) anomalies.push({severity: 'info', code: 'TEXT_OUTSIDE_ROW', page: pg.page, line: ln, message: `Ignored text: "${desc.slice(0, 80)}"`});

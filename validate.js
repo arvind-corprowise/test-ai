@@ -1,5 +1,6 @@
 // Deterministic validation of parsed bank statements. Integer-cent arithmetic only.
 import {formatCents as f} from './money.js';
+const DATE_SHAPE = /^(?:\d{1,2}[ \-/]?[a-z]{3,9}\.?(?:[ ,\-/]+\d{2,4})?|[a-z]{3,9}\.? ?\d{1,2}(?:,? ?\d{4})?|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.\-]\d{1,2}(?:[/.\-]\d{2,4})?)$/i;
 
 /**
  * parsed: output of parseBankStatement (optionally with AI-structured rows marked origin:'ai').
@@ -20,6 +21,11 @@ export function validateStatement(parsed, {pageCount, sourceName = 'statement'} 
     const at = {txn: i, page: t.page, line: t.sourceLines?.[0]};
     t.issues = [];
     const tag = (sev, code, msg) => { add(sev, code, `Row ${i + 1} (${t.date || 'no date'} ${t.description || ''}): ${msg}`, at); t.issues.push({severity: sev, code}); };
+    // Strict schema: date/description are text, amounts are integer cents or null.
+    for (const f of ['withdrawal', 'deposit', 'balance']) if (t[f] !== null && !Number.isSafeInteger(t[f])) tag('error', 'SCHEMA_AMOUNT', `${f} is not a valid amount (${JSON.stringify(t[f])})`);
+    if (t.date !== null && (typeof t.date !== 'string' || !DATE_SHAPE.test(t.date))) tag('error', 'SCHEMA_DATE', `date "${t.date}" is not a recognizable date`);
+    if (typeof t.description !== 'string') tag('error', 'SCHEMA_DESCRIPTION', 'description is not text');
+    else if (/^\s*[-+]?\$?[\d,]*\.\d{2}\s*$/.test(t.description)) tag('error', 'SCHEMA_DESCRIPTION', `description "${t.description}" is a number (column misalignment)`);
     if (!t.description) tag('error', 'MISSING_DESCRIPTION', 'description is missing');
     if (!t.date) tag('error', 'MISSING_DATE', 'date is missing and cannot be carried from a previous row');
     else if (t.dateCarried) tag('info', 'DATE_CARRIED', `date cell is blank in the source; using previous date ${t.date}`);

@@ -1,6 +1,19 @@
 import express from 'express';
 import {generate,download,DATA} from './generator.js';
 import {extractDocument} from './extract.js';
+import {detectBankStatement, parseBankStatement} from './bank.js';
+import {validateStatement, statusLabel} from './validate.js';
+import {formatCents} from './money.js';
+// Deterministic statement table for chat context: values come from the parser, never from the AI.
+function statementMarkdown(name,parsed,v){
+  const cell=c=>c===null||c===undefined?'':formatCents(c);
+  const rows=parsed.transactions.map(t=>`| ${t.date||''} | ${t.description.replace(/\|/g,'/')} | ${cell(t.withdrawal)} | ${cell(t.deposit)} | ${cell(t.balance)} |`);
+  return [`--- ${name}: VERIFIED EXTRACTION (deterministic parser, not AI) ---`,`Status: ${statusLabel(v)}`,
+    parsed.opening?`Opening balance: ${formatCents(parsed.opening.cents)}`:'Opening balance: not found',
+    '| Date | Description | Withdrawals | Deposits | Balance |','|---|---|---|---|---|',...rows,
+    `Totals of extracted rows: withdrawals ${formatCents(v.totals.withdrawals)}, deposits ${formatCents(v.totals.deposits)}; running balance after last row ${v.totals.finalBalance===null?'unknown':formatCents(v.totals.finalBalance)}.`,
+    ...v.issues.filter(i=>i.severity!=='info').slice(0,10).map(i=>`Validation ${i.severity}: ${i.message}`)].join('\n');
+}
 import fileUpload from 'express-fileupload';
 import crypto from 'node:crypto';
 import {listModels, pickModel} from './models.js';
@@ -112,7 +125,7 @@ function tableFromText(text){
     const width=rows[0].length;
     rows=rows.map(r=>{r=r.slice(0,width);while(r.length<width)r.push('');return r});
     // Convert numeric-looking cells (e.g. "4,247.14", "$85.00") to numbers.
-    rows=rows.map((r,i)=>i===0?r:r.map(c=>/^-?\$?[\d,]+(\.\d+)?$/.test(c)?Number(c.replace(/[$,]/g,'')):c));
+    rows=rows.map((r,i)=>i===0?r:r.map(c=>/^-?\$?(?=[\d.]*\d)[\d,]*(\.\d+)?$/.test(c)?Number(c.replace(/[$,]/g,'')):c));
     if(rows.length>=2)return rows;
   }
   return null;
@@ -122,6 +135,11 @@ app.post('/api/export-excel',express.json({limit:'1mb'}),async(req,res)=>{
     const rows=tableFromText(String(req.body?.content||''));
     if(!rows)return res.status(400).json({detail:'No JSON rows or Markdown table found. Ask AI to return a Markdown table or JSON array first.'});
     if(rows.length>5000||rows[0].length>80)return res.status(400).json({detail:'Table too large'});
+    // Remove unintended blank rows; never write text into amount columns.
+    const body=rows.slice(1).filter(r=>r.some(c=>String(c??'').trim()!==''));rows.length=1;rows.push(...body);
+    const amountCols=rows[0].map((h,i)=>/withdraw|deposit|debit|credit|balance|amount|total|\(\$\)/i.test(String(h))?i:-1).filter(i=>i>=0);
+    for(let r=1;r<rows.length;r++)for(const c of amountCols){const v=rows[r][c];
+      if(v!==''&&v!==null&&v!==undefined&&typeof v!=='number')return res.status(400).json({detail:`Row ${r} has text "${String(v).slice(0,40)}" in amount column "${rows[0][c]}". The AI table is misaligned; attach the statement and use Download validated Excel or Create Excel instead.`});}
     const wb=new ExcelJS.Workbook();const ws=wb.addWorksheet('AI Draft');
     for(const row of rows)ws.addRow(row.map(x=>typeof x==='object'?JSON.stringify(x):x));
     ws.getRow(1).font={bold:true};ws.views=[{state:'frozen',ySplit:1}];
@@ -167,20 +185,26 @@ app.post('/api/chat',async(req,res)=>{
     for(const item of history.slice(-12)){
       if(item&&['user','assistant'].includes(item.role)&&typeof item.content==='string')messages.push({role:item.role,content:item.content.slice(0,3000)});
     }
-    const images=[],docs=[];
+    const images=[],docs=[],statements=[];
     for(const file of staged){
       const name=path.basename(file.originalname);
       const ext=path.extname(name).toLowerCase();
       if(!IMAGE.has(ext)&&!DOC.has(ext))return res.status(400).json({detail:`Unsupported file: ${name}`});
       if(IMAGE.has(ext))images.push((await fs.readFile(file.path)).toString('base64'));
-      else if(ext==='.pdf'){
-        // Digital text first (pdftotext -layout); OCR only for scanned pages. Cached by file hash.
+      else if(['.pdf','.csv','.xlsx'].includes(ext)){
+        // Digital text first (pdftotext); OCR only for scanned pages. Cached by file hash.
         const ex=await extractDocument({path:file.path,originalname:name},{dataDir:DATA,model:requestedModel});
-        for(const p of ex.pages)docs.push(`--- ${name}, page ${p.page} of ${ex.pageCount} (${p.method==='text'?'digital text':'OCR'}) ---\n${p.text}`);
+        if(detectBankStatement(ex.pages)){
+          const parsed=parseBankStatement(ex.pages);const v=validateStatement(parsed,{pageCount:ex.pageCount,sourceName:name});
+          if(parsed.transactions.length){docs.push(statementMarkdown(name,parsed,v));statements.push({fileId:file.id,name,status:v.status,transactions:parsed.transactions.length});continue}
+        }
+        if(ext==='.pdf')for(const p of ex.pages)docs.push(`--- ${name}, page ${p.page} of ${ex.pageCount} (${p.method==='text'?'digital text':'OCR'}) ---\n${p.text}`);
+        else docs.push(`--- ${name} ---\n${await extract(file,ext)}`);
       } else docs.push(`--- ${name} ---\n${await extract(file,ext)}`);
     }
     let prompt=message.trim()||'Analyze the attached files.';
     if(docs.length){const combined=docs.join('\n\n');if(combined.length>18000)throw Error('Document text exceeds chat context; use Create Excel with smaller PDFs instead.');prompt+='\n\nAttached documents:\n'+combined;}
+    if(statements.length)messages[0].content+=' A VERIFIED EXTRACTION table is provided for bank statements: it was parsed deterministically from the document and checked against running balances. When showing transactions, copy its dates, descriptions and amounts exactly, keep withdrawals and deposits in their columns, and never add, drop, merge or recalculate rows. Report its validation status honestly.';
     messages.push({role:'user',content:prompt,...(images.length?{images}:{})});
     const visual=images.length>0;
     let selected;
@@ -191,6 +215,7 @@ app.post('/api/chat',async(req,res)=>{
     res.setHeader('Content-Type','application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control','no-cache');
     res.setHeader('X-Accel-Buffering','no');
+    if(statements.length)res.write(JSON.stringify({statement:{fileIds:statements.map(s=>s.fileId),files:statements}})+'\n');
     const reader=upstream.body.getReader();let buffer='';const decoder=new TextDecoder();
     while(true){
       const {done,value}=await reader.read();if(done)break;
